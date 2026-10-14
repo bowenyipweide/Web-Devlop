@@ -1,0 +1,80 @@
+name: CI Tests
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-jest:
+    name: Backend - Jest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install server dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Run Jest tests
+        working-directory: server
+        run: npm test
+
+  frontend-playwright:
+    name: Frontend - Playwright
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # No MongoDB service and no manually started API: playwright.config.js boots
+    # its own backend (client/e2e/backend.cjs) against a throwaway
+    # in-memory MongoDB, so the suite can never write to a real database.
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            server/package-lock.json
+            client/package-lock.json
+
+      - name: Install server dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: client
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright tests
+        working-directory: client
+        run: npm run test:e2e
+
+      - name: Upload Playwright failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-failure-artifacts
+          path: |
+            client/playwright-report/
+            client/test-results/
+          if-no-files-found: ignore
+          retention-days: 7

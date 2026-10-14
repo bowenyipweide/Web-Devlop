@@ -1,0 +1,3 @@
+eventease.ddns.net {
+	reverse_proxy client:80
+}

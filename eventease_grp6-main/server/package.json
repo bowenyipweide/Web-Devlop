@@ -1,0 +1,44 @@
+{
+  "name": "eventease-server",
+  "version": "1.0.0",
+  "description": "EventEase ticketing platform backend (Node.js + Express + MongoDB)",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "seed": "node src/seed.js",
+    "check": "node --check src/index.js && for f in src/models/*.js src/routes/*.js src/controllers/*.js src/middleware/*.js src/utils/*.js src/services/*.js src/config/*.js; do node --check \"$f\" || exit 1; done",
+    "test": "jest --runInBand"
+  },
+  "engines": {
+    "node": ">=20.20.2"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/auto-instrumentations-node": "^0.80.0",
+    "@pyroscope/nodejs": "0.6.3",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.5.1",
+    "morgan": "^1.10.0",
+    "nanoid": "^3.3.7",
+    "nodemailer": "^6.9.14",
+    "qrcode": "^1.5.4",
+    "stripe": "^16.6.0"
+  },
+  "devDependencies": {
+    "jest": "^30.5.2",
+    "mongodb-memory-server": "^11.2.0",
+    "nodemon": "^3.1.4",
+    "supertest": "^7.2.2"
+  },
+  "allowScripts": {
+    "mongodb-memory-server@11.2.0": true
+  }
+}

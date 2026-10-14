@@ -1,0 +1,242 @@
+name: Build and publish Docker images
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: eventease-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - service: client
+            context: ./client
+            image: eventease-client
+          - service: server
+            context: ./server
+            image: eventease-server
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and publish image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:latest
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy:
+    name: Deploy to EC2
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show OIDC identity claims
+        run: |
+          set -euo pipefail
+          response=$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+          token=$(jq -r '.value' <<<"$response")
+          OIDC_TOKEN="$token" python3 - <<'PY'
+          import base64
+          import json
+          import os
+
+          payload = os.environ["OIDC_TOKEN"].split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          for name in ("sub", "aud", "repository", "repository_owner", "ref", "event_name"):
+              print(f"{name}={claims.get(name)}")
+          PY
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: eventease-${{ github.run_id }}
+          allowed-account-ids: "406658519411"
+
+      - name: Deploy commit images through Systems Manager
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          IMAGE_OWNER: ${{ github.repository_owner }}
+          IMAGE_TAG: ${{ github.sha }}
+          DEPLOY_REGION: ${{ vars.AWS_REGION }}
+          APP_PARAMETER_NAME: /eventease/production
+          OTEL_PARAMETER_NAME: /eventease/otel
+        run: |
+          set -euo pipefail
+
+          COMPOSE_FILE_B64=$(base64 -w 0 docker-compose.yml)
+          CADDY_FILE_B64=$(base64 -w 0 Caddyfile)
+
+          DEPLOY_SCRIPT=$(cat <<SCRIPT
+          set -eu
+          cd /home/ubuntu/eventease_grp6
+
+          APP_CONFIG_JSON=\$(aws ssm get-parameter \
+            --name "${APP_PARAMETER_NAME}" \
+            --with-decryption \
+            --region "${DEPLOY_REGION}" \
+            --query Parameter.Value \
+            --output text)
+
+          OTEL_CONFIG_JSON=\$(aws ssm get-parameter \
+            --name "${OTEL_PARAMETER_NAME}" \
+            --with-decryption \
+            --region "${DEPLOY_REGION}" \
+            --query Parameter.Value \
+            --output text)
+
+          CONFIG_JSON=\$(printf '%s\n%s\n' "\${APP_CONFIG_JSON}" "\${OTEL_CONFIG_JSON}" | jq -s '.[0] * .[1]')
+
+          for required_key in GHCR_USERNAME GHCR_TOKEN MONGODB_URI JWT_SECRET CLIENT_URL OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_HEADERS PYROSCOPE_SERVER_ADDRESS PYROSCOPE_BASIC_AUTH_USER PYROSCOPE_BASIC_AUTH_PASSWORD; do
+            if ! printf '%s' "\${CONFIG_JSON}" | jq -e --arg key "\${required_key}" \
+              '(.[\$key] | type == "string") and ((.[\$key] // "") | length > 0)' >/dev/null; then
+              echo "Deployment configuration is missing required key: \${required_key}"
+              exit 1
+            fi
+          done
+
+          ENV_FILE=\$(mktemp /dev/shm/eventease-env.XXXXXX)
+          DOCKER_CONFIG=\$(mktemp -d /dev/shm/eventease-docker.XXXXXX)
+          export DOCKER_CONFIG
+
+          cleanup() {
+            docker logout ghcr.io >/dev/null 2>&1 || true
+            rm -f "\${ENV_FILE}" "\${DOCKER_CONFIG}/config.json"
+            rmdir "\${DOCKER_CONFIG}" 2>/dev/null || true
+            unset GHCR_TOKEN CONFIG_JSON APP_CONFIG_JSON OTEL_CONFIG_JSON
+          }
+          trap cleanup EXIT
+
+          printf '%s' "\${CONFIG_JSON}" | jq -r '
+            del(.GHCR_USERNAME, .GHCR_TOKEN)
+            | to_entries[]
+            | select(.value != null)
+            | "\(.key)=\(.value | tostring | @json)"
+          ' > "\${ENV_FILE}"
+          chmod 600 "\${ENV_FILE}"
+
+          GHCR_USERNAME=\$(printf '%s' "\${CONFIG_JSON}" | jq -r '.GHCR_USERNAME')
+          GHCR_TOKEN=\$(printf '%s' "\${CONFIG_JSON}" | jq -r '.GHCR_TOKEN')
+          printf '%s' "\${GHCR_TOKEN}" | docker login ghcr.io \
+            --username "\${GHCR_USERNAME}" \
+            --password-stdin
+
+          printf '%s' "${COMPOSE_FILE_B64}" | base64 --decode > docker-compose.yml.next
+          chmod 644 docker-compose.yml.next
+          mv docker-compose.yml.next docker-compose.yml
+
+          printf '%s' "${CADDY_FILE_B64}" | base64 --decode > Caddyfile.next
+          chmod 644 Caddyfile.next
+          mv Caddyfile.next Caddyfile
+
+          docker pull ghcr.io/${IMAGE_OWNER}/eventease-client:${IMAGE_TAG}
+          docker pull ghcr.io/${IMAGE_OWNER}/eventease-server:${IMAGE_TAG}
+          docker pull caddy:2-alpine
+
+          docker tag ghcr.io/${IMAGE_OWNER}/eventease-client:${IMAGE_TAG} eventease_grp6-client:latest
+          docker tag ghcr.io/${IMAGE_OWNER}/eventease-server:${IMAGE_TAG} eventease_grp6-server:latest
+
+          docker compose --profile production --env-file "\${ENV_FILE}" up -d --no-build --force-recreate
+
+          attempt=1
+          while [ "\${attempt}" -le 18 ]; do
+            client_health=\$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' eventease-client 2>/dev/null || true)
+            server_health=\$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' eventease-server 2>/dev/null || true)
+            caddy_status=\$(docker inspect --format '{{.State.Status}}' eventease-caddy 2>/dev/null || true)
+
+            echo "Health check \${attempt}/18: client=\${client_health:-missing}, server=\${server_health:-missing}, caddy=\${caddy_status:-missing}"
+
+            if [ "\${client_health}" = healthy ] && [ "\${server_health}" = healthy ] && [ "\${caddy_status}" = running ]; then
+              docker compose --profile production --env-file "\${ENV_FILE}" ps
+              docker image prune -f
+              exit 0
+            fi
+
+            case "\${client_health}:\${server_health}:\${caddy_status}" in
+              *unhealthy*|*exited*|*dead*)
+                docker compose --profile production --env-file "\${ENV_FILE}" ps
+                docker compose --profile production --env-file "\${ENV_FILE}" logs --tail=100
+                exit 1
+                ;;
+            esac
+
+            attempt=\$((attempt + 1))
+            sleep 5
+          done
+
+          echo "Timed out waiting for healthy containers"
+          docker compose --profile production --env-file "\${ENV_FILE}" ps
+          docker compose --profile production --env-file "\${ENV_FILE}" logs --tail=100
+          exit 1
+          SCRIPT
+          )
+
+          jq -n --arg command "$DEPLOY_SCRIPT" '{commands: [$command]}' > ssm-parameters.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy EventEase ${IMAGE_TAG}" \
+            --parameters file://ssm-parameters.json \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM command: $COMMAND_ID"
+
+          set +e
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID"
+          WAIT_EXIT=$?
+          set -e
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}'
+
+          exit "$WAIT_EXIT"

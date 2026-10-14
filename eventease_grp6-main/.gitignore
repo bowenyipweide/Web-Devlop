@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# local environment/secrets
+.env
+.env.local
+.env.*.local
+
+# OS/editor files
+.DS_Store
+__MACOSX/
+.vs
+
+# Playwright
+client/test-results/
+client/playwright-report/
+client/blob-report/
